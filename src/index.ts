@@ -283,6 +283,29 @@ function validateEnvironmentConfig(): void {
     );
   }
 
+  // Validate HERMES_URL — must use https: to protect price data in transit
+  const hermesUrl = (process.env.HERMES_URL ?? "https://hermes.pyth.network").trim();
+  try {
+    const u = new URL(hermesUrl);
+    if (u.protocol !== "https:") {
+      errors.push(
+        `HERMES_URL must use https:, got "${u.protocol}" — a non-HTTPS endpoint ` +
+        `allows price data to be tampered with in transit (Finding 1).`,
+      );
+    }
+  } catch {
+    errors.push(`HERMES_URL is not a valid URL: "${hermesUrl}"`);
+  }
+
+  // Reject if TLS verification is globally disabled — affects all outbound fetches
+  if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
+    errors.push(
+      "NODE_TLS_REJECT_UNAUTHORIZED=0 disables TLS certificate verification for ALL " +
+      "outbound requests (Pyth Hermes, Jupiter, DexScreener). This makes every price " +
+      "source trivially MITMable. Remove this env var before starting the keeper.",
+    );
+  }
+
   // If any validation errors, log them and exit
   if (errors.length > 0) {
     console.error("[FATAL] Environment configuration validation failed:");
@@ -394,7 +417,7 @@ async function fetchPythPrices(symbols: string[]): Promise<void> {
   try {
     const params = ids.map(id => `ids[]=${id}`).join("&");
     const resp = await fetch(
-      `${HERMES_URL}/v2/updates/price/latest?${params}&parsed=true`,
+      `${HERMES_URL}/v2/updates/price/latest?${params}&parsed=true&encoding=base64`,
       { signal: AbortSignal.timeout(5000) },
     );
     if (!resp.ok) {
@@ -402,11 +425,20 @@ async function fetchPythPrices(symbols: string[]): Promise<void> {
       return;
     }
     const json = (await resp.json()) as {
+      binary: { encoding: string; data: string[] };
       parsed: Array<{
         id: string;
         price: { price: string; expo: number; publish_time: number };
       }>;
     };
+
+    // Reject responses that omit the Wormhole binary VAA — a legitimate Pyth Hermes
+    // server always returns it when encoding=base64 is requested. An absent or empty
+    // binary.data array indicates a MITM that stripped the guardian-signed attestation.
+    if (!Array.isArray(json.binary?.data) || json.binary.data.length === 0) {
+      log(`⚠️ Pyth Hermes response missing binary VAA (possible MITM or non-Pyth endpoint) — skipping price update`);
+      return;
+    }
 
     // Build reverse map: feedId → symbol
     const idToSymbol = new Map<string, string>();
