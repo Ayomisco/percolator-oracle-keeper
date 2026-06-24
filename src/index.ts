@@ -206,6 +206,11 @@ const authorityVerified = new Set<string>();
 // otherwise the Solana runtime rejects with "Provided owner is not allowed" (0x10).
 const slabProgramId = new Map<string, PublicKey>();
 
+// Allowlist of trusted on-chain program IDs — slab owners must be in this set.
+// Populated in main() from deployment.json + ADDITIONAL_PROGRAM_IDS env var.
+// Guards against Supabase row injection directing the keeper to an attacker-owned program.
+const EXPECTED_PROGRAM_IDS = new Set<string>();
+
 /**
  * Validate critical environment variables at startup (HIGH-001 security fix)
  *
@@ -300,20 +305,26 @@ function validateEnvironmentConfig(): void {
 // ── Supabase Auto-Discovery ─────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
+// Use anon key for read-only discovery when available — it cannot bypass RLS,
+// limiting the blast radius if the service key leaks.  Service key is still
+// accepted as a fallback so existing deployments keep working.
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY ?? "";
 const DISCOVERY_INTERVAL_MS = parsePositiveNumberEnv("DISCOVERY_INTERVAL_MS", 30000); // 30s
 
-const supabaseEnabled = !!(SUPABASE_URL && SUPABASE_SERVICE_KEY);
+const supabaseEnabled = !!(SUPABASE_URL && (SUPABASE_ANON_KEY || SUPABASE_SERVICE_KEY));
 
 /** Lightweight Supabase REST query — no client library needed */
 async function supabaseQuery(table: string, params: string): Promise<any[] | null> {
   if (!supabaseEnabled) return null;
+  // Prefer the anon key for reads — it is subject to RLS and cannot write
+  const readKey = SUPABASE_ANON_KEY || SUPABASE_SERVICE_KEY;
   try {
     const resp = await fetch(
       `${SUPABASE_URL}/rest/v1/${table}?${params}`,
       {
         headers: {
-          apikey: SUPABASE_SERVICE_KEY,
-          Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+          apikey: readKey,
+          Authorization: `Bearer ${readKey}`,
         },
         signal: AbortSignal.timeout(5000),
       },
@@ -675,6 +686,11 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
       // deployment.json (e.g. old FwfB... vs current FxfD...).
       const slabInfo = await conn.getAccountInfo(new PublicKey(market.slab));
       if (!slabInfo) throw new Error(`Slab account not found: ${market.slab}`);
+      if (!EXPECTED_PROGRAM_IDS.has(slabInfo.owner.toBase58())) {
+        log(`🚨 ${market.label}: slab owned by ${slabInfo.owner.toBase58().slice(0, 12)}... NOT in program-ID allowlist — possible Supabase injection. Permanently skipping.`);
+        skippedMarkets.add(market.slab);
+        return;
+      }
       const slabData = new Uint8Array(slabInfo.data);
       const cfg = parseConfig(slabData);
       if (!cfg.oracleAuthority.equals(admin.publicKey)) {
@@ -1178,6 +1194,15 @@ async function main() {
 
   const deploy = deployRaw ? JSON.parse(deployRaw) : { programId: process.env.PROGRAM_ID, markets: [] };
   const programId = new PublicKey(deploy.programId);
+
+  // Populate slab-owner allowlist.  Any extra program tiers (e.g. legacy or staging
+  // program IDs) can be whitelisted via ADDITIONAL_PROGRAM_IDS (comma-separated).
+  EXPECTED_PROGRAM_IDS.add(deploy.programId);
+  for (const extra of (process.env.ADDITIONAL_PROGRAM_IDS ?? "").split(",").map((s: string) => s.trim()).filter(Boolean)) {
+    EXPECTED_PROGRAM_IDS.add(extra);
+  }
+  log(`Slab owner allowlist: [${[...EXPECTED_PROGRAM_IDS].map(p => p.slice(0, 12)).join(", ")}...]`);
+
   // Assign to module-level `markets` so discovery functions can access it.
   markets = (deploy.markets as MarketInfo[]).filter(m => {
     if (ORACLE_KEEPER_BLOCKED_MARKETS.has(m.slab)) {
@@ -1200,6 +1225,11 @@ async function main() {
       // preventing "Provided owner is not allowed" for markets on different program tiers.
       const slabInfo = await conn.getAccountInfo(new PublicKey(m.slab));
       if (!slabInfo) throw new Error(`Slab account not found`);
+      if (!EXPECTED_PROGRAM_IDS.has(slabInfo.owner.toBase58())) {
+        log(`🚨 STARTUP: ${m.label} — slab owned by ${slabInfo.owner.toBase58().slice(0, 12)}... which is NOT in the expected program-ID allowlist. Possible injected slab. Permanently skipping.`);
+        skippedMarkets.add(m.slab);
+        continue;
+      }
       const slabData = new Uint8Array(slabInfo.data);
       const cfg = parseConfig(slabData);
       if (!cfg.oracleAuthority.equals(admin.publicKey)) {
@@ -1295,6 +1325,11 @@ async function main() {
             try {
               const slabInfo = await conn.getAccountInfo(new PublicKey(m.slab));
               if (!slabInfo) throw new Error(`Slab account not found`);
+              if (!EXPECTED_PROGRAM_IDS.has(slabInfo.owner.toBase58())) {
+                log(`🚨 ${m.label}: slab owned by ${slabInfo.owner.toBase58().slice(0, 12)}... NOT in program-ID allowlist — possible injected row. Permanently skipping.`);
+                skippedMarkets.add(m.slab);
+                continue;
+              }
               const slabData = new Uint8Array(slabInfo.data);
               const cfg = parseConfig(slabData);
               if (!cfg.oracleAuthority.equals(admin.publicKey)) {
