@@ -50,6 +50,13 @@ const PUSH_INTERVAL_MS    = parsePositiveNumberEnv("PUSH_INTERVAL_MS",    3000);
 const HEALTH_PORT         = parsePositiveNumberEnv("HEALTH_PORT",         18810);
 const MAX_PRICE_MOVE_PCT  = parsePositiveNumberEnv("MAX_PRICE_MOVE_PCT",  10);
 const STALE_THRESHOLD_S   = parsePositiveNumberEnv("STALE_THRESHOLD_S",   30);
+// Tighter circuit-breaker threshold for the lowest-trust source (DexScreener / DexScreener-CA).
+// DexScreener reflects raw on-chain pool prices which can be moved by a flash-loan or small
+// targeted swap on low-liquidity devnet pools.  A 5% cap limits the worst-case push while
+// still tracking real market moves.
+const DEXSCREENER_MAX_MOVE_PCT = parsePositiveNumberEnv("DEXSCREENER_MAX_MOVE_PCT", 5);
+// Alert after this many consecutive push cycles where only DexScreener could provide a price.
+const LOW_TRUST_ALERT_CYCLES = parsePositiveNumberEnv("LOW_TRUST_ALERT_CYCLES", 3);
 /**
  * Blocked Markets - Markets that cannot be serviced by this oracle-keeper
  *
@@ -479,26 +486,53 @@ async function fetchDexScreenerPrice(symbol: string): Promise<number | null> {
   } catch { return null; }
 }
 
+// Per-symbol count of consecutive push cycles where only DexScreener had a price.
+// Resets to 0 whenever Pyth or Jupiter succeeds.
+const lowTrustConsecutive = new Map<string, number>();
+
 /** Fetch price with multi-source failover: Pyth → Jupiter → DexScreener → CA lookup */
-async function getPrice(symbol: string, slab?: string): Promise<{ price: number; source: string } | null> {
+async function getPrice(
+  symbol: string,
+  slab?: string,
+): Promise<{ price: number; source: string; maxMovePct: number } | null> {
   // Primary: Pyth (decentralized oracle, fastest for supported tokens)
   const pyth = getPythPrice(symbol);
-  if (pyth) return { price: pyth, source: "pyth" };
+  if (pyth) {
+    lowTrustConsecutive.set(symbol, 0);
+    return { price: pyth, source: "pyth", maxMovePct: MAX_PRICE_MOVE_PCT };
+  }
 
   // Secondary: Jupiter (Solana DEX aggregator, uses mint addresses)
   const jup = await fetchJupiterPrice(symbol);
-  if (jup) return { price: jup, source: "jupiter" };
+  if (jup) {
+    lowTrustConsecutive.set(symbol, 0);
+    return { price: jup, source: "jupiter", maxMovePct: MAX_PRICE_MOVE_PCT };
+  }
 
-  // Tertiary: DexScreener (broad coverage for exotic tokens)
+  // Tertiary: DexScreener (broad coverage for exotic tokens, but manipulable via flash-loan)
   const dex = await fetchDexScreenerPrice(symbol);
-  if (dex) return { price: dex, source: "dexscreener" };
+  if (dex) {
+    const n = (lowTrustConsecutive.get(symbol) ?? 0) + 1;
+    lowTrustConsecutive.set(symbol, n);
+    if (n === LOW_TRUST_ALERT_CYCLES) {
+      log(`🚨 ${symbol}: Pyth AND Jupiter both unavailable for ${n} consecutive cycles — ` +
+          `currently using DexScreener (low-trust, manipulable via thin pools). ` +
+          `Check for rate-limiting or DNS issues. Tighter circuit breaker: ${DEXSCREENER_MAX_MOVE_PCT}%.`);
+    }
+    return { price: dex, source: "dexscreener", maxMovePct: DEXSCREENER_MAX_MOVE_PCT };
+  }
 
   // Quaternary: Direct CA lookup for dynamic markets (PERC-465)
   if (slab) {
     const ca = slabToMainnetCA.get(slab);
     if (ca) {
       const caPrice = await fetchPriceByCA(ca);
-      if (caPrice) return caPrice;
+      if (caPrice) {
+        const isLowTrust = caPrice.source.startsWith("dexscreener");
+        const n = isLowTrust ? (lowTrustConsecutive.get(symbol) ?? 0) + 1 : 0;
+        lowTrustConsecutive.set(symbol, n);
+        return { ...caPrice, maxMovePct: isLowTrust ? DEXSCREENER_MAX_MOVE_PCT : MAX_PRICE_MOVE_PCT };
+      }
     }
   }
 
@@ -551,11 +585,11 @@ function getOrCreateStats(market: MarketInfo): MarketStats {
 }
 
 // ── Circuit Breaker ─────────────────────────────────────────
-function checkCircuitBreaker(stats: MarketStats, newPrice: number): boolean {
+function checkCircuitBreaker(stats: MarketStats, newPrice: number, maxPct: number = MAX_PRICE_MOVE_PCT): boolean {
   if (stats.lastPrice === 0) return true; // First price, always accept
   const movePct = Math.abs((newPrice - stats.lastPrice) / stats.lastPrice) * 100;
-  if (movePct > MAX_PRICE_MOVE_PCT) {
-    log(`🔴 ${stats.symbol}: Circuit breaker! ${stats.lastPrice.toFixed(2)} → ${newPrice.toFixed(2)} (${movePct.toFixed(1)}% > ${MAX_PRICE_MOVE_PCT}%)`);
+  if (movePct > maxPct) {
+    log(`🔴 ${stats.symbol}: Circuit breaker! ${stats.lastPrice.toFixed(2)} → ${newPrice.toFixed(2)} (${movePct.toFixed(1)}% > ${maxPct}%)`);
     stats.circuitBreakerTrips++;
     return false;
   }
@@ -708,10 +742,12 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
   // moves > MAX_PRICE_MOVE_PCT, and s.lastPrice is only set after a successful push.
   let price: number;
   let source: string;
+  let maxMovePct: number = MAX_PRICE_MOVE_PCT;
 
   if (result && isPriceValid(result.price)) {
     price = result.price;
     source = result.source;
+    maxMovePct = result.maxMovePct;
   } else if (s.lastPrice > 0) {
     // Devnet / no-pool fallback: use last successfully pushed price to keep oracle alive.
     // Logged clearly so ops know the market is running on cached data.
@@ -734,8 +770,8 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
     return;
   }
 
-  // Circuit breaker
-  if (!checkCircuitBreaker(s, price)) return;
+  // Circuit breaker — uses a tighter threshold for DexScreener sources
+  if (!checkCircuitBreaker(s, price, maxMovePct)) return;
 
   const priceE6 = BigInt(Math.round(price * 1_000_000));
   const timestamp = BigInt(Math.floor(Date.now() / 1000));
