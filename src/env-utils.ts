@@ -13,13 +13,22 @@
  * If the resulting value is not a finite positive number the process throws
  * immediately — a NaN/Infinity/zero/negative value would silently disable
  * guards (e.g. circuit breaker always-false when MAX_PRICE_MOVE_PCT is NaN).
+ *
+ * Pass `max` for percentage guards: a value ≥ max disables the guard entirely
+ * (e.g. MAX_PRICE_MOVE_PCT ≥ 100 means every price is accepted unconditionally).
  */
-export function parsePositiveNumberEnv(name: string, fallback: number): number {
+export function parsePositiveNumberEnv(name: string, fallback: number, max?: number): number {
   const raw = process.env[name];
   const value = raw == null || raw.trim() === "" ? fallback : Number(raw);
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(
       `${name} must be a finite positive number (got: ${JSON.stringify(raw)})`,
+    );
+  }
+  if (max !== undefined && value >= max) {
+    throw new Error(
+      `${name} must be less than ${max} to keep the guard active (got: ${value}). ` +
+      `A value ≥ ${max} disables the circuit breaker unconditionally.`,
     );
   }
   return value;
