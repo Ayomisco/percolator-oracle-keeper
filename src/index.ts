@@ -88,10 +88,32 @@ const HARDCODED_BLOCKED_MARKETS = new Set<string>([
  *
  * Both are merged at startup. Use environment variable for emergency blocks
  * without redeploying. Use hardcoded for permanent blocks.
+ *
+ * Each environment-supplied address is validated as a valid base58 pubkey at
+ * startup. An invalid address would silently become a Set entry that never
+ * matches any real slab, leaving the intended block unenforced.
  */
+const _envBlockedRaw = (process.env.ORACLE_KEEPER_BLOCKED_MARKETS ?? "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+for (const addr of _envBlockedRaw) {
+  try {
+    new PublicKey(addr);
+  } catch {
+    console.error(
+      `[FATAL] ORACLE_KEEPER_BLOCKED_MARKETS contains invalid base58 pubkey: "${addr}". ` +
+      "Invalid addresses are silently ignored at runtime, leaving the block unenforced. " +
+      "Correct the address or remove it from ORACLE_KEEPER_BLOCKED_MARKETS.",
+    );
+    process.exit(1);
+  }
+}
+
 const ORACLE_KEEPER_BLOCKED_MARKETS = new Set<string>([
   ...HARDCODED_BLOCKED_MARKETS,
-  ...(process.env.ORACLE_KEEPER_BLOCKED_MARKETS ?? "").split(",").map(s => s.trim()).filter(Boolean),
+  ..._envBlockedRaw,
 ]);
 const ADMIN_KP_PATH = process.env.ADMIN_KEYPAIR_PATH ??
   `${process.env.HOME}/.config/solana/percolator-upgrade-authority.json`;
