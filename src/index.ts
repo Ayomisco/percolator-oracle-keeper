@@ -215,7 +215,7 @@ const slabProgramId = new Map<string, PublicKey>();
  * Validates:
  * - RPC_URL: Must be a valid URL (not empty)
  * - SUPABASE_URL: If set, must be valid URL
- * - SUPABASE_SERVICE_ROLE_KEY: If SUPABASE_URL set, key must be non-empty (100+ chars)
+ * - SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY: If SUPABASE_URL set, at least one must be present
  * - API_AUTH_TOKEN: If set, must be non-empty
  * - HEALTH_AUTH_TOKEN: If set, must be non-empty
  *
@@ -242,11 +242,19 @@ function validateEnvironmentConfig(): void {
   // Validate Supabase configuration (if enabled)
   const supabaseUrl = (process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? "").trim();
   const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? "").trim();
+  const supabaseAnonKey = (process.env.SUPABASE_ANON_KEY ?? "").trim();
 
-  if (supabaseUrl && !supabaseKey) {
+  if (supabaseUrl && !supabaseKey && !supabaseAnonKey) {
     errors.push(
-      "SUPABASE_URL is configured but SUPABASE_SERVICE_ROLE_KEY is missing. " +
-      "Either disable Supabase (unset SUPABASE_URL) or provide a service role key.",
+      "SUPABASE_URL is configured but neither SUPABASE_ANON_KEY nor SUPABASE_SERVICE_ROLE_KEY is set. " +
+      "Provide SUPABASE_ANON_KEY (preferred — read-only, RLS-bound) or SUPABASE_SERVICE_ROLE_KEY.",
+    );
+  }
+
+  if (supabaseUrl && supabaseKey && !supabaseAnonKey) {
+    console.warn(
+      "[WARN] SUPABASE_SERVICE_ROLE_KEY bypasses all Supabase RLS and grants full DB write access. " +
+      "Prefer SUPABASE_ANON_KEY for read-only market discovery — it limits blast radius if the key leaks.",
     );
   }
 
@@ -300,9 +308,12 @@ function validateEnvironmentConfig(): void {
 // ── Supabase Auto-Discovery ─────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
+// Prefer the anon key for read-only discovery: it is RLS-bound and safe to expose in logs.
+// Fall back to service key only when no anon key is provided.
+const SUPABASE_READ_KEY = (process.env.SUPABASE_ANON_KEY ?? "").trim() || SUPABASE_SERVICE_KEY;
 const DISCOVERY_INTERVAL_MS = parsePositiveNumberEnv("DISCOVERY_INTERVAL_MS", 30000); // 30s
 
-const supabaseEnabled = !!(SUPABASE_URL && SUPABASE_SERVICE_KEY);
+const supabaseEnabled = !!(SUPABASE_URL && SUPABASE_READ_KEY);
 
 /** Lightweight Supabase REST query — no client library needed */
 async function supabaseQuery(table: string, params: string): Promise<any[] | null> {
@@ -312,8 +323,8 @@ async function supabaseQuery(table: string, params: string): Promise<any[] | nul
       `${SUPABASE_URL}/rest/v1/${table}?${params}`,
       {
         headers: {
-          apikey: SUPABASE_SERVICE_KEY,
-          Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+          apikey: SUPABASE_READ_KEY,
+          Authorization: `Bearer ${SUPABASE_READ_KEY}`,
         },
         signal: AbortSignal.timeout(5000),
       },
@@ -1172,7 +1183,7 @@ async function main() {
     }
   } else {
     console.error("❌ Deployment info not found at", deployPath);
-    console.error("   Run deploy-devnet-mm.ts first, set DEPLOYMENT_JSON env var, or set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY.");
+    console.error("   Run deploy-devnet-mm.ts first, set DEPLOYMENT_JSON env var, or set SUPABASE_URL + SUPABASE_ANON_KEY (or SUPABASE_SERVICE_ROLE_KEY).");
     process.exit(1);
   }
 
@@ -1257,7 +1268,7 @@ async function main() {
       log(`Loaded ${caRows.length} mainnet CA mapping(s) from Supabase`);
     }
   } else {
-    log("⚠️ Supabase not configured — auto-discovery disabled (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)");
+    log("⚠️ Supabase not configured — auto-discovery disabled (set SUPABASE_URL + SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY)");
   }
 
   // Main push loop
