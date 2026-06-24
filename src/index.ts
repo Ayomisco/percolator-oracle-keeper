@@ -42,6 +42,7 @@ import {
 } from "@percolator/sdk";
 import * as fs from "fs";
 import * as http from "http";
+import { timingSafeEqual } from "crypto";
 
 // ── Config ──────────────────────────────────────────────────
 import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-utils.ts";
@@ -890,26 +891,66 @@ async function updateHyperpMark(
 }
 
 // ── Health Check Server ─────────────────────────────────────
+
+// Per-IP last-request timestamp for a simple rate limiter (200ms min gap = max 5 req/s).
+const healthIpLastRequest = new Map<string, number>();
+const HEALTH_RATE_LIMIT_MS = 200;
+
+/**
+ * Timing-safe comparison for the Bearer token.
+ * JavaScript's !== short-circuits on the first differing byte, leaking token length
+ * and prefix via response-time side-channel. timingSafeEqual always compares the
+ * full length in constant time.
+ */
+function timingSafeTokenCheck(provided: string | undefined, expected: string): boolean {
+  if (!provided) return false;
+  const a = Buffer.from(provided, "utf8");
+  const b = Buffer.from(`Bearer ${expected}`, "utf8");
+  if (a.length !== b.length) {
+    // Normalize timing for length-mismatch: compare against a zero-filled buffer
+    // so the branch always does the same amount of work.
+    timingSafeEqual(a, Buffer.alloc(a.length, 0));
+    return false;
+  }
+  return timingSafeEqual(a, b);
+}
+
 function startHealthServer() {
+  if (!HEALTH_AUTH_TOKEN) {
+    console.warn(
+      "[WARN] HEALTH_AUTH_TOKEN is not set. The /health endpoint is unauthenticated. " +
+      "It exposes the keeper wallet address and balance. Set HEALTH_AUTH_TOKEN to a " +
+      "random 32+ character string before deploying to production.",
+    );
+  }
+
   const server = http.createServer((req, res) => {
-    // Auth guard: if HEALTH_AUTH_TOKEN is set, require Bearer token
-    if (HEALTH_AUTH_TOKEN) {
-      const auth = req.headers.authorization;
-      if (auth !== `Bearer ${HEALTH_AUTH_TOKEN}`) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "unauthorized" }));
-        return;
-      }
+    // Per-IP rate limit — prevents timing-attack enumeration and brute force
+    const ip = req.socket.remoteAddress ?? "unknown";
+    const now = Date.now();
+    if (now - (healthIpLastRequest.get(ip) ?? 0) < HEALTH_RATE_LIMIT_MS) {
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "1" });
+      res.end(JSON.stringify({ error: "rate limited" }));
+      return;
+    }
+    healthIpLastRequest.set(ip, now);
+
+    // Auth guard: timing-safe comparison when HEALTH_AUTH_TOKEN is set
+    const isAuthenticated = !HEALTH_AUTH_TOKEN || timingSafeTokenCheck(req.headers.authorization, HEALTH_AUTH_TOKEN);
+    if (!isAuthenticated) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      return;
     }
 
     if (req.url === "/health" || req.url === "/") {
-      const now = Date.now();
-      const uptimeS = Math.floor((now - startTime) / 1000);
+      const nowMs = Date.now();
+      const uptimeS = Math.floor((nowMs - startTime) / 1000);
       const markets: Record<string, any> = {};
       let healthy = true;
 
-      for (const [slab, s] of stats) {
-        const staleSec = s.lastPushAt ? Math.floor((now - s.lastPushAt) / 1000) : -1;
+      for (const [, s] of stats) {
+        const staleSec = s.lastPushAt ? Math.floor((nowMs - s.lastPushAt) / 1000) : -1;
         const isStale = staleSec > STALE_THRESHOLD_S;
         if (isStale) healthy = false;
         markets[s.symbol] = {
@@ -924,19 +965,29 @@ function startHealthServer() {
         };
       }
 
-      // If wallet is low, override status to degraded regardless of market staleness
       if (walletLow) healthy = false;
+
+      // Wallet details: only expose full address and balance to authenticated callers.
+      // Unauthenticated responses (no HEALTH_AUTH_TOKEN configured) return a redacted
+      // address prefix — enough for operator identification without giving an attacker
+      // the full address needed to target the wallet for a dust-drain DoS.
+      const walletPayload = isAuthenticated && HEALTH_AUTH_TOKEN
+        ? {
+            address: admin.publicKey.toBase58(),
+            balanceSol: walletBalanceLamports != null ? walletBalanceLamports / 1e9 : null,
+            minBalanceSol: MIN_KEEPER_BALANCE_LAMPORTS / 1e9,
+            low: walletLow,
+          }
+        : {
+            addressPrefix: admin.publicKey.toBase58().slice(0, 8) + "...",
+            low: walletLow,
+          };
 
       const body = JSON.stringify({
         status: healthy ? "ok" : "degraded",
         uptime: `${uptimeS}s`,
         pushIntervalMs: PUSH_INTERVAL_MS,
-        wallet: {
-          address: admin.publicKey.toBase58(),
-          balanceSol: walletBalanceLamports != null ? walletBalanceLamports / 1e9 : null,
-          minBalanceSol: MIN_KEEPER_BALANCE_LAMPORTS / 1e9,
-          low: walletLow,
-        },
+        wallet: walletPayload,
         markets,
       }, null, 2);
 
@@ -949,7 +1000,7 @@ function startHealthServer() {
   });
 
   server.listen(HEALTH_PORT, HEALTH_BIND, () => {
-    log(`Health endpoint: http://${HEALTH_BIND}:${HEALTH_PORT}/health${HEALTH_AUTH_TOKEN ? " (auth required)" : ""}`);
+    log(`Health endpoint: http://${HEALTH_BIND}:${HEALTH_PORT}/health${HEALTH_AUTH_TOKEN ? " (auth required)" : " (unauthenticated — set HEALTH_AUTH_TOKEN)"}`);
   });
   return server;
 }
