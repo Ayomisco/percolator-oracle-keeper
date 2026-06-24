@@ -551,12 +551,70 @@ function getOrCreateStats(market: MarketInfo): MarketStats {
 }
 
 // ── Circuit Breaker ─────────────────────────────────────────
-function checkCircuitBreaker(stats: MarketStats, newPrice: number): boolean {
-  if (stats.lastPrice === 0) return true; // First price, always accept
-  const movePct = Math.abs((newPrice - stats.lastPrice) / stats.lastPrice) * 100;
+
+/**
+ * Fetch a price from any source other than excludeSource.
+ * Used to cross-validate the first push after a restart (lastPrice=0).
+ */
+async function getSecondaryPrice(symbol: string, excludeSource: string): Promise<number | null> {
+  if (excludeSource !== "pyth") {
+    const pyth = getPythPrice(symbol);
+    if (pyth) return pyth;
+  }
+  if (!excludeSource.startsWith("jupiter")) {
+    const jup = await fetchJupiterPrice(symbol);
+    if (jup) return jup;
+  }
+  if (!excludeSource.startsWith("dexscreener")) {
+    const dex = await fetchDexScreenerPrice(symbol);
+    if (dex) return dex;
+  }
+  return null;
+}
+
+/**
+ * Returns true if the price should be pushed; false if the circuit breaker trips.
+ *
+ * When lastPrice === 0 (process just started / first push ever), the original
+ * code unconditionally accepted any price.  An attacker who controls a price
+ * source and can observe the restart timing (via the /health uptime counter) can
+ * inject an arbitrary price in this window.
+ *
+ * Fix: require a secondary source to corroborate the first push.  If the primary
+ * source is Pyth (Wormhole-attested) and no secondary is available, accept — Pyth
+ * has cryptographic attestation.  Any other source without a corroborating reading
+ * is rejected until a reference price is established.
+ */
+async function checkCircuitBreaker(
+  s: MarketStats,
+  newPrice: number,
+  symbol: string,
+  source: string,
+): Promise<boolean> {
+  if (s.lastPrice === 0) {
+    const secondary = await getSecondaryPrice(symbol, source);
+    if (secondary === null) {
+      if (source === "pyth") {
+        log(`ℹ️ ${s.symbol}: first push from Pyth — accepting without secondary (Wormhole-attested)`);
+        return true;
+      }
+      log(`🔴 ${s.symbol}: first push from ${source} — no secondary available for cross-check. Refusing until reference price established.`);
+      s.circuitBreakerTrips++;
+      return false;
+    }
+    const divergePct = Math.abs((newPrice - secondary) / secondary) * 100;
+    if (divergePct > MAX_PRICE_MOVE_PCT) {
+      log(`🔴 ${s.symbol}: first-push cross-check failed — ${source} $${newPrice.toFixed(2)} vs secondary $${secondary.toFixed(2)} = ${divergePct.toFixed(1)}% > ${MAX_PRICE_MOVE_PCT}%`);
+      s.circuitBreakerTrips++;
+      return false;
+    }
+    log(`ℹ️ ${s.symbol}: first-push cross-check OK — ${source} $${newPrice.toFixed(2)} ≈ secondary $${secondary.toFixed(2)} (${divergePct.toFixed(1)}%)`);
+    return true;
+  }
+  const movePct = Math.abs((newPrice - s.lastPrice) / s.lastPrice) * 100;
   if (movePct > MAX_PRICE_MOVE_PCT) {
-    log(`🔴 ${stats.symbol}: Circuit breaker! ${stats.lastPrice.toFixed(2)} → ${newPrice.toFixed(2)} (${movePct.toFixed(1)}% > ${MAX_PRICE_MOVE_PCT}%)`);
-    stats.circuitBreakerTrips++;
+    log(`🔴 ${s.symbol}: Circuit breaker! ${s.lastPrice.toFixed(2)} → ${newPrice.toFixed(2)} (${movePct.toFixed(1)}% > ${MAX_PRICE_MOVE_PCT}%)`);
+    s.circuitBreakerTrips++;
     return false;
   }
   return true;
@@ -734,8 +792,8 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
     return;
   }
 
-  // Circuit breaker
-  if (!checkCircuitBreaker(s, price)) return;
+  // Circuit breaker (async for first-push cross-check when lastPrice === 0)
+  if (!await checkCircuitBreaker(s, price, market.symbol, source)) return;
 
   const priceE6 = BigInt(Math.round(price * 1_000_000));
   const timestamp = BigInt(Math.floor(Date.now() / 1000));
