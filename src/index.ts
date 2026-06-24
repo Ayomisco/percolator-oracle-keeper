@@ -102,6 +102,14 @@ const RPC_URL = process.env.RPC_URL!;
 
 const conn = new Connection(RPC_URL, "confirmed");
 
+// Optional secondary RPC used to cross-verify transaction inclusion.
+// A malicious or buggy primary RPC can return a fake "confirmed" status
+// for signatures it never broadcast; a secondary RPC catches this.
+const SECONDARY_RPC_URL = process.env.SECONDARY_RPC_URL ?? "";
+const connVerify = SECONDARY_RPC_URL
+  ? new Connection(SECONDARY_RPC_URL, "confirmed")
+  : null;
+
 /**
  * Load oracle keeper admin keypair with security hardening
  * 
@@ -776,6 +784,38 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
       err.txContext = formatTransactionContext(e, tx);
     }
     throw err;
+  }
+
+  // Verify the transaction actually landed on-chain before crediting this push.
+  // sendAndConfirmTransaction polls the same RPC for signature status; a malicious
+  // or overloaded RPC can return {confirmationStatus:"confirmed",err:null} for any
+  // signature — including one it discarded — causing lastPushAt to advance while
+  // on-chain prices remain stale.  Fetching the tx back (preferably via a secondary
+  // RPC) provides an independent confirmation that it was actually included.
+  let pushVerified = true; // default true so missing SECONDARY_RPC_URL doesn't block
+  const verifyConn = connVerify ?? conn; // use secondary if available
+  try {
+    const txInfo = await verifyConn.getTransaction(sig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    if (!txInfo) {
+      log(`⚠️ ${market.label}: tx ${sig.slice(0, 12)}... not found via ${connVerify ? "secondary" : "primary"} RPC — possible silent discard. Not crediting push.`);
+      pushVerified = false;
+    } else if (txInfo.meta?.err) {
+      log(`⚠️ ${market.label}: tx ${sig.slice(0, 12)}... landed with on-chain error: ${JSON.stringify(txInfo.meta.err)} — not crediting push.`);
+      pushVerified = false;
+    }
+  } catch (verifyErr) {
+    // Verification fetch failed (network error, rate limit). Log but still credit the
+    // push — we don't want a flaky secondary RPC to halt all oracle updates.
+    log(`⚠️ ${market.label}: could not verify tx ${sig.slice(0, 12)}... (${(verifyErr as Error).message?.slice(0, 60)}) — crediting push optimistically`);
+  }
+
+  if (!pushVerified) {
+    s.totalErrors++;
+    s.consecutiveErrors++;
+    return; // do not advance lastPushAt — staleness monitor will detect the gap
   }
 
   s.lastPrice = price;
