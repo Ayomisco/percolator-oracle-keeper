@@ -11,13 +11,13 @@
     "test": "node --import tsx/esm --test src/env-validation.test.ts"
   },
   "dependencies": {
-    "@percolator/sdk": "github:dcccrypto/percolator-sdk",
-    "@solana/web3.js": "^1.98.4",
-    "tsx": "^4.19.1"
+    "@percolator/sdk": "github:dcccrypto/percolator-sdk#f137aef5188e",
+    "@solana/web3.js": "1.98.4",
+    "tsx": "4.19.1"
   },
   "devDependencies": {
-    "@types/node": "^20.17.10",
-    "typescript": "^5.9.3"
+    "@types/node": "20.17.10",
+    "typescript": "5.9.3"
   },
   "engines": {
     "node": ">=20"

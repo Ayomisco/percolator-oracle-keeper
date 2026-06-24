@@ -10,10 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends git curl && \
 RUN groupadd -r keeper && useradd -r -g keeper -d /app keeper
 
 # Copy package files
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 
 # Install dependencies (includes tsx runtime)
-RUN npm install --omit=dev
+# npm ci enforces package-lock.json — prevents silent dep upgrades at build time
+RUN npm ci --omit=dev
 
 # Copy source
 COPY src/ src/
